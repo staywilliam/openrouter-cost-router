@@ -36,6 +36,78 @@ function usage(id, tier = 'default') {
 
 const simple = [endpoint('tenstorrent', 0.03, 0.20, 0.001), endpoint('sail-research', 0.04, 0.10, 0.007)];
 
+test('recent input, output, cache hits and cache writes can each change the cheapest endpoint', () => {
+  const endpoints = [
+    endpoint('input', 0.25, 4, 4), endpoint('output', 4, 0.5, 4),
+    endpoint('read', 4, 4, 0.125), endpoint('write', 4, 4, 4),
+  ];
+  for (const row of endpoints) row.pricing.input_cache_write = row.tag === 'write' ? '0.00000075' : '0.000004';
+  const cases = [
+    { input: 1000, output: 10, cached: 0, writes: 0, tag: 'input', microUsd: 290 },
+    { input: 100, output: 1000, cached: 0, writes: 0, tag: 'output', microUsd: 900 },
+    { input: 1000, output: 10, cached: 950, writes: 0, tag: 'read', microUsd: 358.75 },
+    { input: 1000, output: 10, cached: 0, writes: 950, tag: 'write', microUsd: 952.5 },
+  ];
+  for (const { tag, microUsd, ...sample } of cases) {
+    const [winner] = rankEndpoints({ endpoints, body: { model: MODEL }, history: [{ ...sample, reasoning: 0 }] });
+    assert.equal(winner.tag, tag);
+    assert.ok(Math.abs(winner.estimatedUsd * 1e6 - microUsd) < 1e-8);
+  }
+});
+
+test('usage merges partial cache details per field and honors an explicit zero', () => {
+  const counts = { input_tokens: 100, output_tokens: 10, input_tokens_details: { cached_tokens: 60 },
+    prompt_tokens_details: { cached_tokens: 12, cache_write_tokens: 35 } };
+  assert.deepEqual(responseUsage({ usage: counts }), { input: 100, output: 10, cached: 60, writes: 35, reasoning: 0 });
+  counts.input_tokens_details.cache_write_tokens = 0;
+  assert.equal(responseUsage({ usage: counts }).writes, 0);
+});
+
+test('an explicit-only endpoint can use the historical cache rate when the request contains a breakpoint', () => {
+  const endpoints = [endpoint('implicit', 1, 1, 0.4),
+    endpoint('explicit-only', 2, 1, 0.01, { supports_implicit_caching: false })];
+  const history = [{ input: 1000, output: 10, cached: 950, writes: 10, reasoning: 0 }];
+  const rank = body => rankEndpoints({ endpoints, body, history });
+  const [implicit, plain] = rank({ input: 'plain text', prompt_cache_key: 'session' });
+  assert.equal(implicit.tag, 'implicit');
+  assert.equal(plain.forecast.cached, 0);
+  assert.equal(plain.forecast.writes, 0);
+  const content = [{ type: 'input_text', text: 'prefix', cache_control: { type: 'ephemeral' } }];
+  const [marked] = rank({ input: [{ role: 'user', content }] });
+  assert.equal(marked.tag, 'explicit-only');
+  assert.equal(marked.forecast.cached, 950);
+});
+
+test('mixed lengths are billed in their own price tiers and each sample respects the current output cap', () => {
+  const tiered = endpoint('tiered', 1, 1, 0.1);
+  tiered.pricing.overrides = [{ min_prompt_tokens: 1000, prompt: '0.000009' }];
+  const flat = endpoint('flat', 3, 1, 0.1);
+  const history = [
+    { endpoint: 'tiered', input: 500, output: 10, cached: 500, writes: 0, reasoning: 5 },
+    { endpoint: 'tiered', input: 1500, output: 90, cached: 0, writes: 0, reasoning: 70 },
+  ];
+  const ranked = rankEndpoints({ endpoints: [tiered, flat], history, body: { max_output_tokens: 50 } });
+  assert.deepEqual(ranked.map(row => row.tag), ['flat', 'tiered']);
+  for (const [i, expected] of [2305, 6805].entries()) {
+    assert.ok(Math.abs(ranked[i].estimatedUsd * 1e6 - expected) < 1e-8);
+    assert.equal(ranked[i].forecast.output, 30);
+    assert.equal(ranked[i].forecast.reasoning, 27.5);
+  }
+});
+
+test('only normally listed variants with the requested tools compete on published, already discounted prices', () => {
+  const discounted = endpoint('promo', 0.075, 0.225, 0.015);
+  discounted.pricing.discount = 0.75;
+  const endpoints = [discounted, endpoint('regular', 0.05, 0.15), endpoint('regular', 8, 8, 8, { status: -5 }),
+    endpoint('down', 0, 0, 0, { status: -5 }), endpoint('degraded', 0, 0, 0, { status: -2 }),
+    endpoint('no-tools', 0, 0, 0, { status: 0, supported_parameters: [] })];
+  const body = { tools: [{ type: 'function', name: 'read' }] };
+  const history = [{ input: 1000, output: 100, cached: 0, writes: 0, reasoning: 0 }];
+  const ranked = rankEndpoints({ endpoints, body, history });
+  assert.deepEqual(ranked.map(row => row.tag), ['regular', 'promo']);
+  assert.ok(Math.abs(ranked[1].estimatedUsd * 1e6 - 97.5) < 1e-8);
+});
+
 test('a cold-start route learns cache usage from an intact SSE stream and compares the next session', async t => {
   const history = openHistory(':memory:', 'fixture');
   t.after(() => history.close());

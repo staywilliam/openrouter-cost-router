@@ -47,12 +47,16 @@ export function responseUsage(response) {
   const output = tokenCount(usage?.output_tokens);
   if (input === undefined || output === undefined) return null;
 
-  const inputDetails = usage.input_tokens_details ?? usage.prompt_tokens_details;
-  const cached = Math.min(input, tokenCount(inputDetails?.cached_tokens) ?? 0);
+  const inputDetails = usage.input_tokens_details;
+  const promptDetails = usage.prompt_tokens_details;
+  const cached = Math.min(input,
+    tokenCount(inputDetails?.cached_tokens) ?? tokenCount(promptDetails?.cached_tokens) ?? 0);
   const writes = Math.min(
     input - cached,
     tokenCount(inputDetails?.cache_write_tokens)
-      ?? tokenCount(inputDetails?.cache_creation_input_tokens) ?? 0,
+      ?? tokenCount(inputDetails?.cache_creation_input_tokens)
+      ?? tokenCount(promptDetails?.cache_write_tokens)
+      ?? tokenCount(promptDetails?.cache_creation_input_tokens) ?? 0,
   );
   return {
     input, cached, writes, output,
@@ -60,33 +64,34 @@ export function responseUsage(response) {
   };
 }
 
-function averageUsage(rows, body) {
-  if (!rows.length) {
-    const characters = JSON.stringify([body.input, body.instructions, body.tools]).length;
-    return {
-      input: Math.max(1, Math.ceil(characters / 4)), cached: 0, writes: 0,
-      output: Math.min(512, tokenCount(body.max_output_tokens) ?? 512), reasoning: 0,
-    };
-  }
+function usageSamples(history, body) {
+  const outputLimit = tokenCount(body.max_output_tokens) ?? Infinity;
+  if (history.length) return history.map(row => {
+    const output = Math.min(row.output, outputLimit);
+    return { ...row, output, reasoning: Math.min(row.reasoning, output) };
+  });
+  const characters = JSON.stringify([body.input, body.instructions, body.tools]).length;
+  return [{ input: Math.max(1, Math.ceil(characters / 4)), cached: 0, writes: 0,
+    output: Math.min(512, outputLimit), reasoning: 0 }];
+}
+
+function averageUsage(rows) {
   const totals = { input: 0, cached: 0, writes: 0, output: 0, reasoning: 0 };
   for (const row of rows) {
     for (const key of Object.keys(totals)) totals[key] += row[key];
   }
   for (const key of Object.keys(totals)) totals[key] /= rows.length;
-  totals.output = Math.min(totals.output, tokenCount(body.max_output_tokens) ?? Infinity);
-  totals.reasoning = Math.min(totals.reasoning, totals.output);
   return totals;
 }
 
-function applyProviderHistory(usage, samples) {
-  if (!samples.length) return { ...usage };
-  const counts = averageUsage(samples, {});
-  if (!counts.input) return { ...usage };
-  return {
-    ...usage,
-    cached: usage.input * counts.cached / counts.input,
-    writes: usage.input * counts.writes / counts.input,
-  };
+function providerForecasts(samples, tag, ownSamples, cold) {
+  const own = ownSamples && averageUsage(ownSamples);
+  return samples.map(sample => {
+    const useRatio = own?.input > 0 && sample.endpoint !== tag;
+    const cached = useRatio ? sample.input * own.cached / own.input : sample.cached;
+    const writes = useRatio ? sample.input * own.writes / own.input : sample.writes;
+    return { ...sample, cached: cold ? 0 : cached, writes };
+  });
 }
 
 function providerMatches(rule, tag) {
@@ -109,7 +114,9 @@ function quote(endpoint, usage, now) {
   if (!pricing || rate(pricing.prompt) === undefined || rate(pricing.completion) === undefined) {
     return null;
   }
-  const discount = rate(endpoint.discount) ?? 0;
+  // The public catalog's unit prices already include pricing.discount. Only
+  // apply a separate endpoint-level multiplier if that is the sole discount.
+  const discount = pricing.discount == null ? rate(endpoint.discount) ?? 0 : 0;
   if (discount > 1) return null;
   const multiplier = 1 - discount;
   const rates = {};
@@ -150,10 +157,12 @@ function estimatedCost(rates, usage, imageCount) {
 function inputRequirements(body) {
   const modalities = new Set(['text']);
   let images = 0;
+  let cacheBreakpoint = Boolean(body.cache_control || body.tools?.some?.(tool => tool?.cache_control));
   const pending = Array.isArray(body.input) ? [...body.input] : [body.input];
   while (pending.length) {
     const item = pending.pop();
     if (!item || typeof item !== 'object') continue;
+    if (item.cache_control || item.prompt_cache_breakpoint) cacheBreakpoint = true;
     if (item.type === 'input_image') {
       modalities.add('image');
       images++;
@@ -162,7 +171,7 @@ function inputRequirements(body) {
     if (item.type === 'input_audio') modalities.add('audio');
     if (Array.isArray(item.content)) pending.push(...item.content);
   }
-  return { modalities, images, tools: body.tools?.some?.(tool => tool?.type === 'function') };
+  return { modalities, images, cacheBreakpoint, tools: body.tools?.some?.(tool => tool?.type === 'function') };
 }
 
 function servesRequest(endpoint, body, requirements) {
@@ -170,7 +179,7 @@ function servesRequest(endpoint, body, requirements) {
   if (Array.isArray(advertisedInputs)
     && [...requirements.modalities].some(modality => !advertisedInputs.includes(modality))) return false;
   const parameters = endpoint.supported_parameters;
-  if (requirements.tools && parameters?.length && !parameters.includes('tools')) return false;
+  if (requirements.tools && Array.isArray(parameters) && !parameters.includes('tools')) return false;
   if (endpoint.max_completion_tokens > 0 && body.max_output_tokens > endpoint.max_completion_tokens) {
     return false;
   }
@@ -207,7 +216,7 @@ function withinCacheCeiling(endpoint, priced, endpoints, usage, now, ceiling) {
 }
 
 export function rankEndpoints({ endpoints, body, history, session, continuation, options = {}, now = new Date() }) {
-  const usage = averageUsage(history, body);
+  const samples = usageSamples(history, body);
   const samplesByEndpoint = Map.groupBy(history, sample => sample.endpoint);
   const requirements = inputRequirements(body);
   const provider = body.provider ?? {};
@@ -217,25 +226,35 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
   const warm = session && now.getTime() - session.recordedAt <= WARM_CACHE_MS;
   const candidates = [];
 
-  for (const [tag, variants] of Map.groupBy(endpoints, endpoint => endpoint.tag)) {
+  const available = endpoints.filter(endpoint => endpoint.status == null || endpoint.status === 0);
+  for (const [tag, variants] of Map.groupBy(available, endpoint => endpoint.tag)) {
     if (!tag || excluded.some(rule => providerMatches(rule, tag))) continue;
     if (allowed.length && !allowed.some(rule => providerMatches(rule, tag))) continue;
     if (fixedOrder.length && !fixedOrder.some(rule => providerMatches(rule, tag))) continue;
     if (continuation && continuation.endpoint !== tag) continue;
 
-    const forecast = applyProviderHistory(usage, samplesByEndpoint.get(tag) ?? []);
-    if (warm && session.endpoint !== tag) forecast.cached = 0;
+    const forecasts = providerForecasts(samples, tag, samplesByEndpoint.get(tag), warm && session.endpoint !== tag);
     // Several catalog rows can share one routing tag. Use the highest estimate
     // for that tag because the request cannot select an individual row.
     const pricedVariants = variants.map(endpoint => {
       if (!servesRequest(endpoint, body, requirements)) return null;
-      const priced = quote(endpoint, forecast, now);
-      if (!priced || !withinRequestedBudget(priced.rates, provider.max_price)
-        || !withinCacheCeiling(endpoint, priced, endpoints, forecast, now, options.maxCacheRead)) return null;
+      const canCache = endpoint.supports_implicit_caching !== false || requirements.cacheBreakpoint;
+      const billable = canCache ? forecasts : forecasts.map(sample => ({ ...sample, cached: 0, writes: 0 }));
+      let totalUsd = 0;
+      let totalCacheRate = 0;
+      // A tariff can change at a prompt-length threshold. Price the individual
+      // requests before averaging, so short and long prompts pay their own rates.
+      for (const sample of billable) {
+        const priced = quote(endpoint, sample, now);
+        if (!priced || !withinRequestedBudget(priced.rates, provider.max_price)
+          || !withinCacheCeiling(endpoint, priced, endpoints, sample, now, options.maxCacheRead)) return null;
+        totalUsd += estimatedCost(priced.rates, sample, requirements.images);
+        totalCacheRate += priced.rates.input_cache_read ?? priced.rates.prompt;
+      }
       return {
-        tag, tier: endpoint.service_tier ?? null, forecast,
-        cacheReadPerMillion: (priced.rates.input_cache_read ?? priced.rates.prompt) * PER_MILLION,
-        estimatedUsd: estimatedCost(priced.rates, forecast, requirements.images),
+        tag, tier: endpoint.service_tier ?? null, forecast: averageUsage(billable),
+        cacheReadPerMillion: totalCacheRate / billable.length * PER_MILLION,
+        estimatedUsd: totalUsd / billable.length,
       };
     });
     if (pricedVariants.some(candidate => candidate === null)) continue;
