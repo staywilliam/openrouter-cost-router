@@ -1,6 +1,7 @@
 const PER_MILLION = 1_000_000;
 const MINUTE = 60_000;
 const WARM_CACHE_MS = 5 * MINUTE;
+const NON_4BIT_FORMATS = ['fp6', 'int8', 'fp8', 'mxfp8', 'fp16', 'bf16', 'fp32'];
 const PRICE_FIELDS = [
   'prompt', 'completion', 'input_cache_read', 'input_cache_write', 'internal_reasoning', 'request', 'image',
 ];
@@ -96,6 +97,10 @@ function providerForecasts(samples, tag, ownSamples, cold) {
 
 function providerMatches(rule, tag) {
   return typeof rule === 'string' && (tag === rule || tag.startsWith(`${rule}/`));
+}
+
+function allowedQuantizations(provider) {
+  return NON_4BIT_FORMATS.filter(format => provider?.quantizations == null || provider.quantizations.includes(format));
 }
 
 function timeMatches(override, now) {
@@ -226,16 +231,19 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
   const warm = session && now.getTime() - session.recordedAt <= WARM_CACHE_MS;
   const candidates = [];
 
-  const available = endpoints.filter(endpoint => endpoint.status == null || endpoint.status === 0);
-  for (const [tag, variants] of Map.groupBy(available, endpoint => endpoint.tag)) {
+  const formats = allowedQuantizations(provider);
+  const available = endpoints.filter(endpoint => (endpoint.status == null || endpoint.status === 0)
+    && formats.includes(endpoint.quantization));
+  const groups = Map.groupBy(available, endpoint => `${endpoint.tag}/${endpoint.quantization}`);
+  for (const variants of groups.values()) {
+    const { tag, quantization } = variants[0];
     if (!tag || excluded.some(rule => providerMatches(rule, tag))) continue;
     if (allowed.length && !allowed.some(rule => providerMatches(rule, tag))) continue;
     if (fixedOrder.length && !fixedOrder.some(rule => providerMatches(rule, tag))) continue;
     if (continuation && continuation.endpoint !== tag) continue;
 
     const forecasts = providerForecasts(samples, tag, samplesByEndpoint.get(tag), warm && session.endpoint !== tag);
-    // Several catalog rows can share one routing tag. Use the highest estimate
-    // for that tag because the request cannot select an individual row.
+    // Rows sharing both tag and precision cannot be pinned separately.
     const pricedVariants = variants.map(endpoint => {
       if (!servesRequest(endpoint, body, requirements)) return null;
       const canCache = endpoint.supports_implicit_caching !== false || requirements.cacheBreakpoint;
@@ -252,7 +260,7 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
         totalCacheRate += priced.rates.input_cache_read ?? priced.rates.prompt;
       }
       return {
-        tag, tier: endpoint.service_tier ?? null, forecast: averageUsage(billable),
+        tag, quantization, tier: endpoint.service_tier ?? null, forecast: averageUsage(billable),
         cacheReadPerMillion: totalCacheRate / billable.length * PER_MILLION,
         estimatedUsd: totalUsd / billable.length,
       };
@@ -267,14 +275,17 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
   return candidates;
 }
 
-export function pinnedProvider(original, selectedTag, endpoints) {
+export function pinnedProvider(original, selectedTag, endpoints, quantization) {
   const siblings = endpoints.map(endpoint => endpoint.tag).filter(
     tag => tag && tag !== selectedTag && providerMatches(selectedTag, tag),
   );
+  const formats = allowedQuantizations(original).filter(format => quantization === undefined || quantization === format);
+  if (!formats.length) throw new RoutingError('No permitted endpoint quantization matches this request.');
   const selection = {
     ...original,
     only: [selectedTag],
     order: [selectedTag],
+    quantizations: formats,
     ignore: [...new Set([...(original?.ignore ?? []), ...siblings])],
     allow_fallbacks: false,
   };

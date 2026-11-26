@@ -14,7 +14,7 @@ const BASE = 'http://127.0.0.1';
 const AT = Date.UTC(2026, 10, 26, 9, 0);
 
 function endpoint(tag, prompt, completion, cached, extra = {}) {
-  return { tag, supported_parameters: ['tools'], pricing: {
+  return { tag, quantization: 'fp8', supported_parameters: ['tools'], pricing: {
     prompt: String(prompt / 1e6), completion: String(completion / 1e6),
     ...(cached === undefined ? {} : { input_cache_read: String(cached / 1e6) }),
   }, ...extra };
@@ -178,9 +178,53 @@ test('ranking uses current discounts and time-window overrides and preserves a b
 
 test('pinning a base tag excludes its catalog siblings and retains request policies', () => {
   const endpoints = ['a', 'a/us', 'a/flex', 'b'].map(tag => ({ tag }));
-  assert.deepEqual(pinnedProvider({ ignore: ['wafer'], zdr: true, sort: 'price' }, 'a', endpoints), {
-    only: ['a'], order: ['a'], ignore: ['wafer', 'a/us', 'a/flex'], zdr: true, allow_fallbacks: false,
+  assert.deepEqual(pinnedProvider({ ignore: ['wafer'], zdr: true, sort: 'price' }, 'a', endpoints, 'fp16'), {
+    only: ['a'], order: ['a'], ignore: ['wafer', 'a/us', 'a/flex'], quantizations: ['fp16'], zdr: true, allow_fallbacks: false,
   });
+});
+
+test('requests and retries pin the cheapest allowed precision even when tags are shared', async t => {
+  const history = openHistory(':memory:', 'fixture');
+  t.after(() => history.close());
+  const endpoints = ['fp4', 'mxfp4', 'nvfp4', 'int4', 'unknown', null, undefined, 'unrecognized']
+    .map(quantization => endpoint('shared', 0, 0, 0, { quantization }));
+  endpoints.push(endpoint('shared', 0.1, 0.1), endpoint('shared', 0.2, 0.2, 0, { quantization: 'fp16' }));
+  const attempts = [];
+  const gateway = createGateway({ apiKey: KEY, history, options: { fallbackRatio: 3 }, fetcher: async (url, init) => {
+    if (url.pathname.endsWith('/endpoints')) return Response.json({ data: { endpoints } });
+    const { provider } = JSON.parse(init.body);
+    assert.deepEqual(provider.only, ['shared']);
+    assert.equal(provider.allow_fallbacks, false);
+    attempts.push(provider.quantizations);
+    if (attempts.length === 1) return Response.json({}, { status: 429 });
+    return Response.json(usage('gen-' + attempts.length));
+  } });
+  const request = { model: MODEL, input: 'hi' };
+  assert.equal((await gateway(local('/v1/responses', request))).status, 200);
+  assert.deepEqual(attempts, [['fp8'], ['fp16']]);
+  const status = await (await gateway(local('/status'))).json();
+  assert.equal(status.lastDecision.quantization, 'fp16');
+  assert.equal(status.lastDecision.pricedEndpoints, 2);
+  const onlyFp16 = { ...request, provider: { quantizations: ['fp16', 'fp4'] } };
+  assert.equal((await gateway(local('/v1/responses', onlyFp16))).status, 200);
+  assert.deepEqual(attempts[2], ['fp16']);
+  const onlyFp4 = { ...request, provider: { quantizations: ['fp4', 'unknown'] } };
+  assert.equal((await gateway(local('/v1/responses', onlyFp4))).status, 422);
+  assert.equal(attempts.length, 3);
+});
+
+test('an old continuation pinned to a four-bit endpoint is rejected before inference', async t => {
+  const history = openHistory(':memory:', 'fixture');
+  t.after(() => history.close());
+  history.record({ model: MODEL, endpoint: 'old', response: 'gen-prev', recordedAt: AT, usage: responseUsage(usage('gen-prev')) });
+  const endpoints = [endpoint('old', 0, 0, 0, { quantization: 'nvfp4' }), endpoint('new', 1, 1)];
+  const gateway = createGateway({ apiKey: KEY, history, clock: () => AT, fetcher: async url => {
+    assert.ok(url.pathname.endsWith('/endpoints'));
+    return Response.json({ data: { endpoints } });
+  } });
+  const result = await gateway(local('/v1/responses', { model: MODEL, input: 'next', previous_response_id: 'gen-prev' }));
+  assert.equal(result.status, 422);
+  assert.match((await result.json()).error.message, /quantization/);
 });
 
 test('fallbacks are limited by the configured estimate ratio', async t => {

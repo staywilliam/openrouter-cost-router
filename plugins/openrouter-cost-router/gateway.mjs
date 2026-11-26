@@ -119,8 +119,8 @@ export function createGateway({ apiKey, history, options = {}, fetcher = fetch, 
     const model = endpointModel(body);
     const provider = body.provider;
     if (provider !== undefined && provider !== null && (typeof provider !== 'object' || Array.isArray(provider)
-      || ['ignore', 'only', 'order'].some(key => provider[key] != null && !Array.isArray(provider[key])))) {
-      throw new RoutingError('Expected provider preferences with array values for only, ignore, and order.', 400);
+      || ['ignore', 'only', 'order', 'quantizations'].some(key => provider[key] != null && !Array.isArray(provider[key])))) {
+      throw new RoutingError('Expected provider preferences with array values for only, ignore, order, and quantizations.', 400);
     }
     const endpoints = await endpointsFor(model);
     const now = clock();
@@ -134,26 +134,26 @@ export function createGateway({ apiKey, history, options = {}, fetcher = fetch, 
     const ranked = rankEndpoints({ endpoints, body, history: recent, session: history.session(model, sessionId),
       continuation, options, now: new Date(now) });
     if (!ranked.length) {
-      throw new RoutingError(`No priced endpoint for ${model} can satisfy this request and the configured limits.`);
+      throw new RoutingError(`No priced endpoint for ${model} satisfies the request and routing limits. A published non-4-bit quantization is required.`);
     }
 
     const maximum = ranked[0].estimatedUsd * (options.fallbackRatio ?? 1);
     const eligible = ranked.filter(candidate => candidate.estimatedUsd <= maximum + 1e-12);
-    const lowestEstimates = ranked.slice(0, 5).map(({ tag, estimatedUsd }) => ({ endpoint: tag, estimatedUsd }));
+    const lowestEstimates = ranked.slice(0, 5).map(({ tag, quantization, estimatedUsd }) => ({ endpoint: tag, quantization, estimatedUsd }));
     const target = new URL('responses', UPSTREAM);
     target.search = query;
     const headers = outgoingHeaders(request.headers, apiKey);
     headers.set('content-type', 'application/json');
     for (const [index, winner] of eligible.entries()) {
       const decision = {
-        model, endpoint: winner.tag, estimatedUsd: winner.estimatedUsd,
+        model, endpoint: winner.tag, quantization: winner.quantization, estimatedUsd: winner.estimatedUsd,
         cacheReadPerMillion: winner.cacheReadPerMillion, estimatedTokens: winner.forecast,
         samples: recent.length, pricedEndpoints: ranked.length, lowestEstimates, attempts: index + 1,
       };
       lastDecision = decision;
       const upstream = await fetcher(target, {
         method: 'POST', redirect: 'error', headers, signal: request.signal,
-        body: JSON.stringify({ ...body, provider: pinnedProvider(provider, winner.tag, endpoints) }),
+        body: JSON.stringify({ ...body, provider: pinnedProvider(provider, winner.tag, endpoints, winner.quantization) }),
       });
       decision.upstreamStatus = upstream.status;
       if (index + 1 < eligible.length && await unavailable(upstream)) {
