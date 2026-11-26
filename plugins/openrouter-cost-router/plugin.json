@@ -1,0 +1,15 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "openrouter-cost-router",
+  "version": "0.1.0",
+  "description": "Configure a local OpenRouter gateway that compares provider prices with recent Codex token usage.",
+  "extensions": {
+    "com.openai": {
+      "onboardingSkill": "./skills/openrouter-cost-router/SKILL.md",
+      "interface": {
+        "displayName": "OpenRouter Cost Router",
+        "shortDescription": "Run Codex through a local cost-aware OpenRouter gateway"
+      }
+    }
+  }
+}
