@@ -80,7 +80,7 @@ async function unavailable(response) {
   // A 404 for missing credentials, a missing model, or a bad continuation
   // should reach the caller. Retry only when routing found no eligible endpoint.
   const error = await response.clone().json().catch(() => null);
-  return /no endpoints?\b/i.test(error?.error?.message ?? '');
+  return /\bno (?:endpoints?|allowed providers are available)\b/i.test(error?.error?.message ?? '');
 }
 
 export function createGateway({ apiKey, history, options = {}, fetcher = fetch, clock = Date.now }) {

@@ -115,12 +115,14 @@ test('fallbacks are limited by the configured estimate ratio', async t => {
   const history = openHistory(':memory:', 'fixture');
   t.after(() => history.close());
   const endpoints = [endpoint('first', 0.01, 0.10), endpoint('second', 0.011, 0.11), endpoint('expensive', 1, 1)];
+  const unavailableMessage = 'No allowed providers are available for the selected model. '
+    + `Providers serving ${MODEL}: second, but your request's provider.only preference permits only: first.`;
   const attempts = [];
   const fetcher = async (url, init) => {
     if (url.pathname.endsWith('/endpoints')) return Response.json({ data: { endpoints } });
     const selected = JSON.parse(init.body).provider.only[0];
     attempts.push(selected);
-    if (selected === 'first') return Response.json({ error: { message: 'No endpoints found' } }, { status: 404 });
+    if (selected === 'first') return Response.json({ error: { message: unavailableMessage } }, { status: 404 });
     return Response.json(usage('gen-fallback'));
   };
 
