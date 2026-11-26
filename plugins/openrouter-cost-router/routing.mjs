@@ -271,7 +271,9 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
     )));
   }
 
-  candidates.sort((a, b) => a.estimatedUsd - b.estimatedUsd || a.tag.localeCompare(b.tag));
+  candidates.sort((a, b) => a.estimatedUsd - b.estimatedUsd
+    || a.cacheReadPerMillion - b.cacheReadPerMillion
+    || a.tag.localeCompare(b.tag));
   return candidates;
 }
 

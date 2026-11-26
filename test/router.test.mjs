@@ -36,6 +36,25 @@ function usage(id, tier = 'default') {
 
 const simple = [endpoint('tenstorrent', 0.03, 0.20, 0.001), endpoint('sail-research', 0.04, 0.10, 0.007)];
 
+test('cold-start cost ties prefer cheaper cache reads while a higher total still ranks last', async t => {
+  const endpoints = [endpoint('alpha', 0.05, 0.30, 0.003), endpoint('bravo', 0.05, 0.30, 0.002),
+    endpoint('cheapest-cache', 0.075, 0.30, 0.0015)];
+  const history = openHistory(':memory:', 'fixture');
+  t.after(() => history.close());
+  const gateway = createGateway({ apiKey: KEY, history, fetcher: async (url, init) => {
+    if (url.pathname.endsWith('/endpoints')) return Response.json({ data: { endpoints } });
+    assert.deepEqual(JSON.parse(init.body).provider.only, ['bravo']);
+    return Response.json(usage('gen-tie'));
+  } });
+  assert.equal((await gateway(local('/v1/responses', { model: MODEL, input: 'hello' }))).status, 200);
+  const { lastDecision } = await (await gateway(local('/status'))).json();
+  const [first, second, third] = lastDecision.lowestEstimates;
+  assert.equal(lastDecision.samples, 0);
+  assert.equal(first.estimatedUsd, second.estimatedUsd);
+  assert.ok(second.estimatedUsd < third.estimatedUsd);
+  assert.deepEqual([first.endpoint, second.endpoint, third.endpoint], ['bravo', 'alpha', 'cheapest-cache']);
+});
+
 test('recent input, output, cache hits and cache writes can each change the cheapest endpoint', () => {
   const endpoints = [
     endpoint('input', 0.25, 4, 4), endpoint('output', 4, 0.5, 4),
