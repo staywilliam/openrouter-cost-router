@@ -1,6 +1,6 @@
 const PER_MILLION = 1_000_000;
-const MINUTE = 60_000;
-const WARM_CACHE_MS = 5 * MINUTE;
+// OpenRouter's session affinity window is a routing heuristic, not a cache TTL.
+const SESSION_AFFINITY_MS = 60 * 60_000;
 const NON_4BIT_FORMATS = ['fp6', 'int8', 'fp8', 'mxfp8', 'fp16', 'bf16', 'fp32'];
 const PRICE_FIELDS = [
   'prompt', 'completion', 'input_cache_read', 'input_cache_write', 'internal_reasoning', 'request', 'image',
@@ -85,14 +85,25 @@ function averageUsage(rows) {
   return totals;
 }
 
-function providerForecasts(samples, tag, ownSamples, cold) {
+function providerForecasts(samples, tag, ownSamples) {
   const own = ownSamples && averageUsage(ownSamples);
   return samples.map(sample => {
     const useRatio = own?.input > 0 && sample.endpoint !== tag;
     const cached = useRatio ? sample.input * own.cached / own.input : sample.cached;
     const writes = useRatio ? sample.input * own.writes / own.input : sample.writes;
-    return { ...sample, cached: cold ? 0 : cached, writes };
+    return { ...sample, cached, writes };
   });
+}
+
+function billableCacheUsage(sample, canCache, cold, writeRate, reusableWrites) {
+  if (!canCache) return { ...sample, cached: 0, writes: 0 };
+  if (cold) {
+    const rebuild = writeRate === undefined ? 0 : sample.cached;
+    return { ...sample, cached: 0, writes: sample.writes + rebuild };
+  }
+  // A prefix just written on a read-free turn can be read on the next turn.
+  const reused = Math.min(reusableWrites, sample.writes);
+  return { ...sample, cached: sample.cached + reused, writes: sample.writes - reused };
 }
 
 function providerMatches(rule, tag) {
@@ -228,7 +239,8 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
   const excluded = [...(provider.ignore ?? []), ...(options.ignore ?? [])];
   const allowed = provider.only ?? [];
   const fixedOrder = provider.allow_fallbacks === false ? provider.order ?? [] : [];
-  const warm = session && now.getTime() - session.recordedAt <= WARM_CACHE_MS;
+  const previous = continuation ?? session;
+  const active = previous && now.getTime() - previous.recordedAt < SESSION_AFFINITY_MS;
   const candidates = [];
 
   const formats = allowedQuantizations(provider);
@@ -242,21 +254,27 @@ export function rankEndpoints({ endpoints, body, history, session, continuation,
     if (fixedOrder.length && !fixedOrder.some(rule => providerMatches(rule, tag))) continue;
     if (continuation && continuation.endpoint !== tag) continue;
 
-    const forecasts = providerForecasts(samples, tag, samplesByEndpoint.get(tag), warm && session.endpoint !== tag);
+    const sameEndpoint = previous?.endpoint === tag;
+    const cold = previous && !(active && sameEndpoint);
+    const reusableWrites = active && sameEndpoint && previous.cached === 0 ? previous.writes : 0;
+    const ownSamples = samplesByEndpoint.get(tag) ?? (sameEndpoint ? [previous] : undefined);
+    const forecasts = providerForecasts(samples, tag, ownSamples);
     // Rows sharing both tag and precision cannot be pinned separately.
     const pricedVariants = variants.map(endpoint => {
       if (!servesRequest(endpoint, body, requirements)) return null;
       const canCache = endpoint.supports_implicit_caching !== false || requirements.cacheBreakpoint;
-      const billable = canCache ? forecasts : forecasts.map(sample => ({ ...sample, cached: 0, writes: 0 }));
+      const billable = [];
       let totalUsd = 0;
       let totalCacheRate = 0;
       // A tariff can change at a prompt-length threshold. Price the individual
       // requests before averaging, so short and long prompts pay their own rates.
-      for (const sample of billable) {
+      for (const sample of forecasts) {
         const priced = quote(endpoint, sample, now);
         if (!priced || !withinRequestedBudget(priced.rates, provider.max_price)
           || !withinCacheCeiling(endpoint, priced, endpoints, sample, now, options.maxCacheRead)) return null;
-        totalUsd += estimatedCost(priced.rates, sample, requirements.images);
+        const usage = billableCacheUsage(sample, canCache, cold, priced.rates.input_cache_write, reusableWrites);
+        billable.push(usage);
+        totalUsd += estimatedCost(priced.rates, usage, requirements.images);
         totalCacheRate += priced.rates.input_cache_read ?? priced.rates.prompt;
       }
       return {

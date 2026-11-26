@@ -36,6 +36,37 @@ function usage(id, tier = 'default') {
 
 const simple = [endpoint('tenstorrent', 0.03, 0.20, 0.001), endpoint('sail-research', 0.04, 0.10, 0.007)];
 
+test('after a pause, another endpoint must rebuild the prefix even if its reads are cheaper', () => {
+  const session = { endpoint: 'current', recordedAt: AT, input: 1000, cached: 800, writes: 50, output: 10, reasoning: 0 };
+  const other = endpoint('other', 1, 1, 0.01);
+  other.pricing.overrides = [{ min_prompt_tokens: 500, input_cache_write: '0.000002' }];
+  const endpoints = [endpoint('current', 1, 1, 0.1), other];
+  const rank = minutes => rankEndpoints({ endpoints, body: {}, history: [session], session, now: new Date(AT + minutes * 60_000) });
+  const [stay, change] = rank(6);
+  assert.equal(stay.tag, 'current');
+  assert.equal(stay.forecast.cached, 800);
+  assert.equal(change.forecast.cached, 0);
+  assert.equal(change.forecast.writes, 850);
+  assert.ok(Math.abs(change.estimatedUsd * 1e6 - 1860) < 1e-8);
+  const expired = rank(60);
+  assert.ok(expired.every(candidate => candidate.forecast.cached === 0));
+  assert.equal(expired.find(candidate => candidate.tag === 'current').forecast.writes, 50);
+});
+
+test('a write-only first turn can warm the original endpoint for a continuation', () => {
+  const continuation = { endpoint: 'same', recordedAt: AT, input: 1000, cached: 0, writes: 800, output: 10, reasoning: 0 };
+  const same = endpoint('same', 1, 1, 0.1);
+  same.pricing.input_cache_write = '0.000002';
+  const config = { endpoints: [same], body: {}, history: [continuation], continuation };
+  const [next] = rankEndpoints({ ...config, now: new Date(AT + 1000) });
+  assert.equal(next.forecast.cached, 800);
+  assert.equal(next.forecast.writes, 0);
+  assert.ok(Math.abs(next.estimatedUsd * 1e6 - 290) < 1e-8);
+  const [expired] = rankEndpoints({ ...config, now: new Date(AT + 61 * 60_000) });
+  assert.equal(expired.forecast.cached, 0);
+  assert.equal(expired.forecast.writes, 800);
+});
+
 test('cold-start cost ties prefer cheaper cache reads while a higher total still ranks last', async t => {
   const endpoints = [endpoint('alpha', 0.05, 0.30, 0.003), endpoint('bravo', 0.05, 0.30, 0.002),
     endpoint('cheapest-cache', 0.075, 0.30, 0.0015)];
